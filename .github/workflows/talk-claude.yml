@@ -61,16 +61,40 @@ jobs:
           MODE: ${{ steps.check.outputs.mode }}
         run: |
           npm install -g @anthropic-ai/claude-code >/dev/null 2>&1
-          if [ "$MODE" = "topic" ]; then
-            # 話題出しのときだけ、ウェブ検索を許可する
-            claude -p --max-turns 8 --output-format text \
-              --allowedTools "WebSearch,WebFetch" \
-              --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,Task" \
-              < work/prompt.txt > work/reply.txt 2>/dev/null
-          else
-            claude -p --max-turns 1 --output-format text \
-              --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task" \
-              < work/prompt.txt > work/reply.txt 2>/dev/null
+          ask() {
+            if [ "$MODE" = "topic" ]; then
+              # 話題出しのときだけ、ウェブ検索を許可する
+              claude -p --max-turns 8 --output-format text \
+                --allowedTools "WebSearch,WebFetch" \
+                --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,Task" \
+                < work/prompt.txt > work/reply.txt 2> work/claude_err.txt
+            else
+              claude -p --max-turns 1 --output-format text \
+                --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task" \
+                < work/prompt.txt > work/reply.txt 2> work/claude_err.txt
+            fi
+          }
+          # エラーの理由だけを短く記録する（会話の本文は出さない）
+          show_err() {
+            echo "claude exit code: $1"
+            echo "claude error (last lines, up to 300 chars):"
+            tail -n 3 work/claude_err.txt | cut -c1-300 || true
+            echo "reply head (up to 200 chars, error check only):"
+            if [ "$(wc -m < work/reply.txt)" -lt 400 ]; then head -c 200 work/reply.txt; echo; fi
+          }
+          # 一時的なエラーに備えて、失敗したら60秒待って1回だけやり直す
+          set +e
+          ask; rc=$?
+          if [ $rc -ne 0 ] || [ ! -s work/reply.txt ]; then
+            show_err $rc
+            echo "retry once after 60s"
+            sleep 60
+            ask; rc=$?
+          fi
+          set -e
+          if [ $rc -ne 0 ] || [ ! -s work/reply.txt ]; then
+            show_err $rc
+            exit 1
           fi
           echo "mode: $MODE / reply chars: $(wc -m < work/reply.txt)"   # 中身は出さない
 
