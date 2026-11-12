@@ -28,8 +28,10 @@ ALIASES = {
     "海未": "MUSE", "うみ": "MUSE", "MUSE": "MUSE", "MUSE（海未）": "MUSE",
     "ChatGPT": "ChatGPT", "Claude": "Claude",
 }
-STOP_MARK = "【会話終了】"
+STOP_MARKS = ["【会話終了】", "【合意できず】"]
+AGREE_MARK = "【合意】"
 NEW_TOPIC_MARK = "【新しい話題】"
+PAUSE_MARK, RESUME_MARK = "【自動話題 停止】", "【自動話題 再開】"
 HEADER_RE = re.compile(r"^\s*(.+?)\s*[／/]\s*(\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2})")
 RECENT_MESSAGES = 15     # Claudeに渡す直近の発言数
 MAX_REPLY_CHARS = 1500   # 念のための上限（Notionの1ブロックは2000字まで）
@@ -155,16 +157,55 @@ def decide(msgs, participants, max_turns):
         return False, "last-is-self"
     topic = current_topic(msgs)
     for m in topic:
-        if STOP_MARK in m["body"]:
+        if any(mark in m["body"] for mark in STOP_MARKS):
             return False, "stop-mark"
         if m["author"] == "HUMAN" and "止めて" in m["body"]:
             return False, "human-stop"
-    ai_turns = sum(1 for m in topic if m["author"] != "HUMAN")
+    ai_msgs = [m for m in topic if m["author"] != "HUMAN"]
+    order = [p for p in ROTATION if p in participants]
+    tail = ai_msgs[-len(order):]
+    if (len(tail) == len(order) and {m["author"] for m in tail} == set(order)
+            and all(AGREE_MARK in m["body"] for m in tail)):
+        return False, "consensus"
+    ai_turns = len(ai_msgs)
     if ai_turns >= max_turns:
         return False, f"max-turns({ai_turns}/{max_turns})"
     if next_speaker(last["author"], participants) != SELF:
         return False, f"not-my-turn(next={next_speaker(last['author'], participants)})"
     return True, f"my-turn(turn {ai_turns + 1}/{max_turns})"
+
+
+def agree_streak(msgs):
+    """今の話題の最後から数えて、【合意】が続いているAIの人数（Claude以外、重複なし）。"""
+    names = []
+    for m in reversed(current_topic(msgs)):
+        if m["author"] == "HUMAN" or AGREE_MARK not in m["body"] or m["author"] in names:
+            break
+        names.append(m["author"])
+    return names
+
+
+def msg_time(m):
+    return datetime.strptime(m["time"].replace("T", " "), "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+
+
+def decide_topic(msgs, participants, idle_hours, now):
+    """会話が idle_hours 以上止まっていて、話題を出す番がClaudeなら True。"""
+    bodies = [m["body"] for m in msgs]
+    last_pause = max([i for i, b in enumerate(bodies) if PAUSE_MARK in b], default=-1)
+    last_resume = max([i for i, b in enumerate(bodies) if RESUME_MARK in b], default=-1)
+    if last_pause > last_resume:
+        return False, "auto-topic-paused"
+    if msgs:
+        idle = (now - msg_time(msgs[-1])).total_seconds() / 3600
+        if idle < idle_hours:
+            return False, f"not-idle({idle:.1f}h)"
+    order = [p for p in ROTATION if p in participants]
+    starters = [m["author"] for m in msgs if m["author"] in order and NEW_TOPIC_MARK in m["body"]]
+    starter = order[0] if not starters else order[(order.index(starters[-1]) + 1) % len(order)]
+    if starter != SELF:
+        return False, f"not-my-topic-turn(starter={starter})"
+    return True, "my-topic-turn"
 
 
 # ---------- コマンド ----------
@@ -227,33 +268,62 @@ def cmd_prepare(args):
     page = os.environ["TALK_PAGE_ID"]
     participants = [p.strip() for p in os.environ.get("PARTICIPANTS", "MUSE,Claude").split(",")]
     max_turns = int(os.environ.get("MAX_TURNS", "10"))
+    idle_hours = float(os.environ.get("IDLE_HOURS", "12"))
+    event = os.environ.get("GITHUB_EVENT_NAME", "")
     sig_next = read_signal().get("next")
-    if os.environ.get("GITHUB_EVENT_NAME") == "push" and sig_next and sig_next != SELF:
-        # 呼び鈴の宛先がClaudeでなければ、Notionも読まずに終わる（両方の一致を条件にする）
-        print(f"decision: run=False reason=signal-next={sig_next}")
-        set_output("run", "false")
+    msgs = None
+    mode = None
+    # 1) 返事：呼び鈴（SIGNAL.md）の宛先とトークの順番の両方がClaudeのとき
+    if event == "workflow_dispatch" or not sig_next or sig_next == SELF:
+        msgs = parse_messages(list_blocks(page))
+        run, reason = decide(msgs, participants, max_turns)
+        print(f"decision(reply): run={run} reason={reason} messages={len(msgs)}")  # 中身は出さない
+        if run:
+            mode = "reply"
+    else:
+        print(f"decision(reply): run=False reason=signal-next={sig_next}")
+    # 2) 話題出し：定期実行のときだけ。半日止まっていて、話題を出す番がClaudeなら
+    if mode is None and event == "schedule":
+        if msgs is None:
+            msgs = parse_messages(list_blocks(page))
+        run, reason = decide_topic(msgs, participants, idle_hours, datetime.now(JST))
+        print(f"decision(topic): run={run} reason={reason}")
+        if run:
+            mode = "topic"
+    set_output("run", "true" if mode else "false")
+    set_output("mode", mode or "none")
+    if not mode:
         return
-    msgs = parse_messages(list_blocks(page))
-    run, reason = decide(msgs, participants, max_turns)
-    print(f"decision: run={run} reason={reason} messages={len(msgs)}")  # 中身は出さない
-    set_output("run", "true" if run else "false")
-    if not run:
-        return
+
     os.makedirs(args.out, exist_ok=True)
     rules = open(os.path.join(os.path.dirname(__file__), "..", "prompts", "claude_talk_rules.md"),
                  encoding="utf-8").read()
     recent = msgs[-RECENT_MESSAGES:]
     convo = "\n\n".join(f"[{m['author_raw']}／{m['time']}]\n{m['body']}" for m in recent)
-    prompt = (
-        f"{rules}\n\n"
-        f"<conversation>\n{convo}\n</conversation>\n\n"
-        "上の会話の続きとして、Claudeの次の発言の本文だけを出力してください。"
-    )
+    if mode == "reply":
+        agreed = agree_streak(msgs)
+        hint = ""
+        if agreed:
+            hint = (f"\n\n（参考：直前に【合意】を書いているのは {'、'.join(agreed)} です。"
+                    "あなたも本当に納得しているなら【合意】を書いてかまいません。"
+                    "これで全員そろう場合は、合意した内容を2〜3行でまとめてから最後の行に【合意】と書いてください。"
+                    "納得していないなら、合わせずに理由を書いてください。）")
+        task = "上の会話の続きとして、Claudeの次の発言の本文だけを出力してください。" + hint
+        turn = sum(1 for m in current_topic(msgs) if m["author"] != "HUMAN") + 1
+    else:
+        task = ("会話が半日以上止まっているので、あなたが新しい話題を1つ出す番です。"
+                "自分で考えた話題でも、ウェブ検索で見つけた最近の話題でもかまいません。"
+                "検索した場合は、本文の最後に「出典：サイト名 URL」を1行添えてください。"
+                "3人で意見を出し合い、納得できるところまで話せる問いの形にしてください。"
+                "本人の個人情報、資産やFXなどの非公開情報には触れないでください。"
+                "【新しい話題】の印や名前・日時は書かず、話題の本文だけを出力してください（300字以内）。")
+        turn = 1
+    prompt = f"{rules}\n\n<conversation>\n{convo}\n</conversation>\n\n{task}"
     with open(os.path.join(args.out, "prompt.txt"), "w", encoding="utf-8") as f:
         f.write(prompt)
     with open(os.path.join(args.out, "state.json"), "w", encoding="utf-8") as f:
-        json.dump({"replied_to": msgs[-1]["id"], "participants": participants,
-                   "turn": sum(1 for m in current_topic(msgs) if m["author"] != "HUMAN") + 1}, f)
+        json.dump({"replied_to": msgs[-1]["id"] if msgs else None, "participants": participants,
+                   "turn": turn, "mode": mode}, f)
 
 
 def paragraph(text):
@@ -271,7 +341,7 @@ def cmd_post(args):
 
     # 書き込む直前にもう一度読み、返事を考えている間に状況が変わっていないか確かめる
     msgs = parse_messages(list_blocks(page))
-    if not msgs or msgs[-1]["id"] != state["replied_to"]:
+    if (msgs[-1]["id"] if msgs else None) != state["replied_to"]:
         print("conversation changed while thinking; skip posting")
         set_output("posted", "false")
         return
@@ -280,6 +350,8 @@ def cmd_post(args):
     passed = reply.strip() == "【パス】"
     children = [{"object": "block", "type": "divider", "divider": {}},
                 paragraph(f"Claude／{now} JST")]
+    if state.get("mode") == "topic":
+        children.append(paragraph(NEW_TOPIC_MARK))
     if passed:
         children.append(paragraph("（今回は書くことがないので、次へ回します）"))
     else:
