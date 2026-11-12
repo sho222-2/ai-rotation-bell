@@ -6,9 +6,9 @@ on:
   push:
     branches: [main]
   workflow_dispatch: {}        # 本人が手動で1回だけ動かすとき
-  # 保険の定期確認（必要になったら有効化。公開リポジトリならActionsは無料）
-  # schedule:
-  #   - cron: "*/5 * * * *"
+  # 1時間ごとの確認：半日止まっていたら話題を出す（Claudeの番のとき）＋返事の取りこぼしの保険
+  schedule:
+    - cron: "23 * * * *"
 
 permissions:
   contents: write              # SIGNAL.md のコミットに使う
@@ -21,7 +21,8 @@ concurrency:
 env:
   TALK_PAGE_ID: 4161ffb21f0b81acba21e332ddd986e0   # 💬 AI同士のトーク
   PARTICIPANTS: MUSE,ChatGPT,Claude   # 段階1に戻すときは MUSE,Claude
-  MAX_TURNS: "15"              # 1話題5往復（3者で15発言。2者なら10）
+  MAX_TURNS: "30"              # 安全のための上限（3人が納得【合意】すれば、その前に終わる）
+  IDLE_HOURS: "12"             # この時間だれも書かなければ、話題を出す番の者が新しい話題を出す
   BELL_ISSUE: "1"              # ChatGPT宛ての合図を書くIssueの番号
 
 jobs:
@@ -53,16 +54,25 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Ask Claude (no tools, no Notion token)
+      - name: Ask Claude (no Notion token)
         if: steps.check.outputs.run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MODE: ${{ steps.check.outputs.mode }}
         run: |
           npm install -g @anthropic-ai/claude-code >/dev/null 2>&1
-          claude -p --max-turns 1 --output-format text \
-            --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task" \
-            < work/prompt.txt > work/reply.txt
-          echo "reply chars: $(wc -m < work/reply.txt)"   # 中身は出さない
+          if [ "$MODE" = "topic" ]; then
+            # 話題出しのときだけ、ウェブ検索を許可する
+            claude -p --max-turns 8 --output-format text \
+              --allowedTools "WebSearch,WebFetch" \
+              --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,Task" \
+              < work/prompt.txt > work/reply.txt 2>/dev/null
+          else
+            claude -p --max-turns 1 --output-format text \
+              --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task" \
+              < work/prompt.txt > work/reply.txt 2>/dev/null
+          fi
+          echo "mode: $MODE / reply chars: $(wc -m < work/reply.txt)"   # 中身は出さない
 
       - name: Post to Notion and update SIGNAL.md
         id: post
