@@ -61,4 +61,19 @@ jobs:
         id: post
         if: steps.check.outputs.run == 'true'
         env:
-          NOTION_TOKEN: ${{
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: python scripts/talk_bot.py post --work work
+
+      - name: Ring the bell
+        if: steps.post.outputs.posted == 'true'
+        run: |
+          git config user.name  "claude-talk-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add SIGNAL.md
+          git commit -m "bell: Claude -> ${{ steps.post.outputs.next }}"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Clean up
+        if: always()
+        run: rm -rf work
