@@ -169,10 +169,64 @@ def set_output(key, value):
             f.write(f"{key}={value}\n")
 
 
+def read_signal(path="SIGNAL.md"):
+    """SIGNAL.md の「key: value」行を辞書にする。無ければ空。"""
+    sig = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            if ":" in line and not line.startswith("#"):
+                k, v = line.split(":", 1)
+                sig[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return sig
+
+
+def github(method, path, body=None):
+    req = urllib.request.Request(
+        f"https://api.github.com{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                 "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"GitHub API error: {method} {path.split('?')[0]} -> HTTP {e.code}")
+
+
+def cmd_notify(args):
+    """次がChatGPTのとき、合図用Issueに1行コメントする（GitHubの通知メールでChatGPTを起こす）。
+    同じ message_id には2回コメントしない。会話の本文は書かない。"""
+    sig = read_signal()
+    if sig.get("next") != "ChatGPT":
+        print(f"notify: skip (next={sig.get('next')})")
+        return
+    mid = sig.get("message_id", "")
+    repo, num = os.environ["GITHUB_REPOSITORY"], os.environ["BELL_ISSUE"]
+    count = github("GET", f"/repos/{repo}/issues/{num}").get("comments", 0)
+    last_page = max(1, (count + 99) // 100)
+    recent = github("GET", f"/repos/{repo}/issues/{num}/comments?per_page=100&page={last_page}")
+    if mid and any(mid in c.get("body", "") for c in recent):
+        print("notify: already sent for this message_id")
+        return
+    body = (f"AI-TALK bell: {sig.get('from', '?')} -> ChatGPT\n\n"
+            f"message_id: {mid}\nturn: {sig.get('turn', '?')}\n"
+            f"page: AI-TALK-20261112-01\nupdated_at: {sig.get('updated_at', '?')}")
+    github("POST", f"/repos/{repo}/issues/{num}/comments", {"body": body})
+    print("notify: sent")
+
+
 def cmd_prepare(args):
     page = os.environ["TALK_PAGE_ID"]
     participants = [p.strip() for p in os.environ.get("PARTICIPANTS", "MUSE,Claude").split(",")]
     max_turns = int(os.environ.get("MAX_TURNS", "10"))
+    sig_next = read_signal().get("next")
+    if os.environ.get("GITHUB_EVENT_NAME") == "push" and sig_next and sig_next != SELF:
+        # 呼び鈴の宛先がClaudeでなければ、Notionも読まずに終わる（両方の一致を条件にする）
+        print(f"decision: run=False reason=signal-next={sig_next}")
+        set_output("run", "false")
+        return
     msgs = parse_messages(list_blocks(page))
     run, reason = decide(msgs, participants, max_turns)
     print(f"decision: run={run} reason={reason} messages={len(msgs)}")  # 中身は出さない
@@ -249,8 +303,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p1 = sub.add_parser("prepare"); p1.add_argument("--out", default="work")
     p2 = sub.add_parser("post"); p2.add_argument("--work", default="work")
+    sub.add_parser("notify")
     args = ap.parse_args()
-    {"prepare": cmd_prepare, "post": cmd_post}[args.cmd](args)
+    {"prepare": cmd_prepare, "post": cmd_post, "notify": cmd_notify}[args.cmd](args)
 
 
 if __name__ == "__main__":
