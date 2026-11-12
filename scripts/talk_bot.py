@@ -109,12 +109,18 @@ def parse_messages(blocks):
 
     out = []
     for m in msgs:
-        first = m["lines"][0]
-        mm = HEADER_RE.match(first.splitlines()[0])
-        if not mm:
+        # 見出し行（名前／日時）を探す。見出しの前に「【新しい話題】」などが置かれていてもよい
+        idx, mm = None, None
+        for i, line in enumerate(m["lines"]):
+            mm = HEADER_RE.match(line.splitlines()[0])
+            if mm:
+                idx = i
+                break
+        if idx is None:
             continue  # 「（ここに、新しいものを下へ積みます）」などの説明文は飛ばす
-        rest_first = "\n".join(first.splitlines()[1:])
-        body = "\n".join([x for x in [rest_first] + m["lines"][1:] if x.strip()])
+        head = m["lines"][idx]
+        rest_first = "\n".join(head.splitlines()[1:])
+        body = "\n".join([x for x in m["lines"][:idx] + [rest_first] + m["lines"][idx + 1:] if x.strip()])
         out.append({
             "author": canonical(mm.group(1)),
             "author_raw": mm.group(1),
