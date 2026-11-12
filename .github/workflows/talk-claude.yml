@@ -1,1 +1,64 @@
+# AI三者トーク：Claude担当（段階1：海未＋Claude）
+# 呼び鈴（このリポジトリ）へのコミットで起動し、Claudeの番のときだけ返事を書く。
+name: talk-claude
 
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}        # 本人が手動で1回だけ動かすとき
+  # 保険の定期確認（必要になったら有効化。公開リポジトリならActionsは無料）
+  # schedule:
+  #   - cron: "*/5 * * * *"
+
+permissions:
+  contents: write              # SIGNAL.md のコミットに使う
+
+concurrency:
+  group: talk-claude           # 同時に2つ動かない（二重返信の防止）
+  cancel-in-progress: false
+
+env:
+  TALK_PAGE_ID: 4161ffb21f0b81acba21e332ddd986e0   # 💬 AI同士のトーク
+  PARTICIPANTS: MUSE,Claude    # 段階2で MUSE,ChatGPT,Claude にする
+  MAX_TURNS: "10"              # 1話題5往復（2者なら10発言。3者にしたら15）
+
+jobs:
+  reply:
+    # Claude自身のコミットには反応しない（GITHUB_TOKENのコミットはもともと起動しないが念のため）
+    if: "github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'bell: Claude')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check whose turn it is
+        id: check
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: python scripts/talk_bot.py prepare --out work
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.run == 'true'
+        with:
+          node-version: "20"
+
+      - name: Ask Claude (no tools, no Notion token)
+        if: steps.check.outputs.run == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          npm install -g @anthropic-ai/claude-code >/dev/null 2>&1
+          claude -p --max-turns 1 --output-format text \
+            --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task" \
+            < work/prompt.txt > work/reply.txt
+          echo "reply chars: $(wc -m < work/reply.txt)"   # 中身は出さない
+
+      - name: Post to Notion and update SIGNAL.md
+        id: post
+        if: steps.check.outputs.run == 'true'
+        env:
+          NOTION_TOKEN: ${{
