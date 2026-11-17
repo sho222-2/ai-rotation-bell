@@ -54,6 +54,7 @@ jobs:
         with:
           node-version: "20"
 
+      # 2026-11-17 本人決定：週間上限の消費を抑えるため Sonnet 固定（あわせて現行 Claude Code に無い MultiEdit を禁止一覧から除去）
       - name: Ask Claude (no Notion token)
         if: steps.check.outputs.run == 'true'
         env:
@@ -64,13 +65,13 @@ jobs:
           ask() {
             if [ "$MODE" = "topic" ]; then
               # 話題出しのときだけ、ウェブ検索を許可する
-              claude -p --max-turns 8 --output-format text \
+              claude -p --model sonnet --max-turns 8 --output-format text \
                 --allowedTools "WebSearch,WebFetch" \
-                --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,Task" \
+                --disallowedTools "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep,Task" \
                 < work/prompt.txt > work/reply.txt 2> work/claude_err.txt
             else
-              claude -p --max-turns 1 --output-format text \
-                --disallowedTools "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task" \
+              claude -p --model sonnet --max-turns 1 --output-format text \
+                --disallowedTools "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task" \
                 < work/prompt.txt > work/reply.txt 2> work/claude_err.txt
             fi
           }
